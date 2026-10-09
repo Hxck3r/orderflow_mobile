@@ -51,6 +51,10 @@ android {
 }
 
 dependencies {
+    // appcompat brings kotlin-stdlib 1.8.22, games-activity's tree the old
+    // kotlin-stdlib-jdk7/jdk8 1.6.21 with the same classes (checkDebugDuplicateClasses
+    // fails): the BOM lifts those to 1.8.22, where they are empty shims.
+    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.core:core:1.13.1'
     // The Java side of android-activity's GameActivity glue: its README pins
