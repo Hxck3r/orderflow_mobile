@@ -14,7 +14,7 @@ import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
-import com.google.androidx.gamesdk.GameActivity;
+import com.google.androidgamesdk.GameActivity;
 
 /**
  * The one activity of the app. The terminal itself is Rust (libof_mobile.so,
