@@ -170,12 +170,23 @@ public class MainActivity extends GameActivity {
         controller.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
     }
 
+    /** GameActivity's own insets listener on its surface: it sees the keyboard come and go. */
+    @Override
+    public WindowInsetsCompat onApplyWindowInsets(View v, WindowInsetsCompat insets) {
+        WindowInsetsCompat result = super.onApplyWindowInsets(v, insets);
+        sendInsets(insets);
+        return result;
+    }
+
     private void sendInsets() {
         View decor = getWindow().getDecorView();
         if (decor.getRootWindowInsets() == null) {
             return; // Not attached yet; the first layout sends them.
         }
-        WindowInsetsCompat insets = WindowInsetsCompat.toWindowInsetsCompat(decor.getRootWindowInsets(), decor);
+        sendInsets(WindowInsetsCompat.toWindowInsetsCompat(decor.getRootWindowInsets(), decor));
+    }
+
+    private void sendInsets(WindowInsetsCompat insets) {
         Insets i = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
         // The keyboard covers the bottom: the terminal lays out above it.
         int bottom = Math.max(i.bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom);

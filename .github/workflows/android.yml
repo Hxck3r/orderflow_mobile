@@ -75,6 +75,8 @@ jobs:
         with:
           key: android
           cache-all-crates: true
+          # A failed Gradle step must not cost the next run a cold Rust build.
+          cache-on-failure: true
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
@@ -85,6 +87,10 @@ jobs:
           echo "NDK: $ANDROID_NDK_HOME"
           cargo ndk -t arm64-v8a --platform 30 -o android/app/src/main/jniLibs build --release --locked -p of-mobile
           ls -la android/app/src/main/jniLibs/arm64-v8a
+
+      # The host job never compiles the Android-only code (android.rs): lint it here.
+      - name: Clippy for Android (must stay warning-free)
+        run: cargo ndk -t arm64-v8a --platform 30 clippy --release --locked -p of-mobile -- -D warnings
 
       # What the Java side calls must be exported, and no C++ runtime may be
       # needed that the APK does not carry (android-activity links c++_static).
