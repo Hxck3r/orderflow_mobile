@@ -1,0 +1,102 @@
+# Checks the Rust code on Linux and builds the APK for the phone. The PC
+# version comes in as the submodule upstream/orderflow at its pinned commit.
+#
+# The APK is debug-signed and lands in the run's artifacts
+# ("of-mobile-debug-apk"): download it on the phone and install.
+name: Android
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  host:
+    name: Format, clippy, tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      # The version, components and the Android target come from rust-toolchain.toml.
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      # OpenSSL headers for native-tls on the host build.
+      - name: Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+
+      # Also reads the PC version's files the crate takes through #[path]:
+      # they must stay exactly as upstream formats them.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (must stay warning-free)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Includes the PC version's own UI tests, compiled inside of-mobile.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  apk:
+    name: APK (arm64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          rustup target list --installed
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+          cache-all-crates: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # The runner image has the Android SDK and NDK; ANDROID_NDK_HOME points at its default NDK.
+      - name: Build libof_mobile.so
+        run: |
+          echo "NDK: $ANDROID_NDK_HOME"
+          cargo ndk -t arm64-v8a --platform 30 -o android/app/src/main/jniLibs build --release --locked -p of-mobile
+          ls -la android/app/src/main/jniLibs/arm64-v8a
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build the APK
+        run: |
+          gradle -p android assembleDebug --no-daemon
+          cp android/app/build/outputs/apk/debug/app-debug.apk of-mobile-debug.apk
+          ls -la of-mobile-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: of-mobile-debug-apk
+          path: of-mobile-debug.apk
+          if-no-files-found: error

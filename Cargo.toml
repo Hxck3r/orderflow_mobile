@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# The PC version is a submodule with a workspace of its own; its crates are
+# path dependencies of of-mobile, never members here.
+exclude = ["upstream"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+# The PC version's lint configuration: of-mobile compiles its UI sources as its
+# own modules, so clippy must judge them by the same rules.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+enum_variant_names = "allow"
+
+# Profiles come only from the root workspace; these match the PC version.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = false

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- enableOnBackInvokedCallback="false": back keeps arriving as KEYCODE_BACK,
+         which MainActivity turns into "move to the background". -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@drawable/ic_launcher"
+        android:theme="@style/Theme.OrderFlow"
+        android:enableOnBackInvokedCallback="false"
+        android:hasFragileUserData="true">
+
+        <!-- configChanges: rotation, resizing, DeX and the rest must not recreate
+             the activity, because the Rust event loop cannot be started twice in
+             one process (winit 0.30). singleTask: one activity for the process. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden|navigation|locale|layoutDirection|fontScale|colorMode|touchscreen"
+            android:windowSoftInputMode="adjustNothing">
+            <!-- GameActivity loads lib<name>.so: crates/of-mobile builds libof_mobile.so. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="of_mobile" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

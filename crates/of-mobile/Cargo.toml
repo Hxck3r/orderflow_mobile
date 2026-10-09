@@ -1,0 +1,40 @@
+[package]
+name = "of-mobile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+# cdylib: libof_mobile.so loaded by the Android activity; rlib: host tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+of-core = { path = "../../upstream/orderflow/crates/of-core" }
+of-feed = { path = "../../upstream/orderflow/crates/of-feed" }
+of-storage = { path = "../../upstream/orderflow/crates/of-storage" }
+of-engine = { path = "../../upstream/orderflow/crates/of-engine" }
+
+# The PC version's of-app dependencies (upstream/orderflow/Cargo.toml), for its
+# UI sources compiled here.
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "default_fonts"] }
+egui_dock = { version = "0.21.1", features = ["serde"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+fontdue = "0.9.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = { version = "0.4", features = ["std"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["android-game-activity"] }
+# Names the `AndroidApp` eframe takes; the same crate and feature winit uses.
+android-activity = { version = "0.6.1", features = ["game-activity"] }
+# of-feed talks TLS through native-tls, which is OpenSSL on Android and reads
+# the system's certificates itself; `vendored` builds OpenSSL with the NDK.
+native-tls = { version = "0.2", features = ["vendored"] }
+
+# A desktop Linux build only so that tests and clippy run on the host.
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["x11", "wayland"] }
+
+[lints]
+workspace = true

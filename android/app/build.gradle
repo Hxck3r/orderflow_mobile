@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.orderflow.mobile'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.orderflow.mobile'
+        // Android 11: no older phone is a target (plan §8).
+        minSdk 30
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0'
+        ndk {
+            // The S25 Ultra and every current phone; libof_mobile.so is built for it only.
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core:1.13.1'
+    // The Java side of android-activity's GameActivity glue: its README pins
+    // 4.4.0 for android-activity 0.6.1, without prefab (the C++ glue is in Rust).
+    implementation 'androidx.games:games-activity:4.4.0'
+}

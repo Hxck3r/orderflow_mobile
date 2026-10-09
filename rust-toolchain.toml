@@ -1,0 +1,7 @@
+# The same compiler as the PC version (upstream/orderflow/rust-toolchain.toml):
+# its sources are compiled here as they are, so its lints must agree.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src"]
+targets = ["aarch64-linux-android"]

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- GameActivity is an AppCompatActivity. Black behind the Rust surface, drawn
+         into the camera cutout too: the shell keeps its content out of it by insets. -->
+    <style name="Theme.OrderFlow" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>

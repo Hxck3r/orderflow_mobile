@@ -1,0 +1,18 @@
+// The Android package around libof_mobile.so (crates/of-mobile, built by
+// `cargo ndk` into app/src/main/jniLibs before Gradle runs).
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "orderflow-mobile"
+include(":app")
