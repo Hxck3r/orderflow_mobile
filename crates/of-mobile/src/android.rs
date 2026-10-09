@@ -115,12 +115,12 @@ fn android_main(app: AndroidApp) {
     log::info!("of-mobile {} starting (launch {launch} in this process)", env!("CARGO_PKG_VERSION"));
     if launch > 1 {
         // winit 0.30 creates one event loop per process, ever: a recreated
-        // activity cannot get a second one. MainActivity keeps its one
-        // activity alive and ends the process on a real destroy, so this is
-        // a safety net: leave, and the next launch starts a fresh process.
-        log::warn!("the activity was recreated in a live process: restarting the process");
+        // activity cannot get a second one. MainActivity ends the process before
+        // a second activity gets here; should one still, returning finishes it
+        // (the glue calls GameActivity_finish) and its onDestroy ends the process.
+        log::warn!("the activity was recreated in a live process: finishing it");
         log::logger().flush();
-        std::process::exit(0);
+        return;
     }
 
     let settings = crate::shell::load_settings();

@@ -3,6 +3,9 @@ package com.orderflow.mobile;
 import android.os.Bundle;
 import android.os.Process;
 import android.util.Log;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -47,6 +50,7 @@ public class MainActivity extends GameActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        writeJavaCrashesToFile();
         if (started) {
             // The process outlived its activity: start over in a fresh one.
             Log.w(TAG, "activity recreated in a live process: restarting");
@@ -133,6 +137,31 @@ public class MainActivity extends GameActivity {
         Log.i(TAG, "activity destroyed: ending the process");
         Process.killProcess(Process.myPid());
         super.onDestroy();
+    }
+
+    /**
+     * A Java exception before Rust starts logging (a missing native library,
+     * a broken JNI call) would show only in logcat, which a phone without a
+     * PC does not show: write it next to the Rust log
+     * (Android/data/com.orderflow.mobile/files/logs/java-crash.log).
+     */
+    private void writeJavaCrashesToFile() {
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        final File dir = new File(getExternalFilesDir(null), "logs");
+        Thread.setDefaultUncaughtExceptionHandler((thread, error) -> {
+            try {
+                dir.mkdirs();
+                try (PrintWriter out = new PrintWriter(new FileWriter(new File(dir, "java-crash.log"), true))) {
+                    out.println(new java.util.Date() + " thread " + thread.getName());
+                    error.printStackTrace(out);
+                }
+            } catch (Throwable ignored) {
+                // Nothing more to do: the original handler still runs.
+            }
+            if (previous != null) {
+                previous.uncaughtException(thread, error);
+            }
+        });
     }
 
     private void hideSystemBars() {

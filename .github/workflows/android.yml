@@ -1,8 +1,9 @@
 # Checks the Rust code on Linux and builds the APK for the phone. The PC
 # version comes in as the submodule upstream/orderflow at its pinned commit.
 #
-# The APK is debug-signed and lands in the run's artifacts
-# ("of-mobile-debug-apk"): download it on the phone and install.
+# The APK is signed with the repository's debug key (android/app/debug.keystore),
+# so each build installs over the last, and lands in the run's artifacts
+# ("of-mobile-debug-apk", a zip holding of-mobile-debug.apk).
 name: Android
 
 on:
@@ -84,6 +85,19 @@ jobs:
           echo "NDK: $ANDROID_NDK_HOME"
           cargo ndk -t arm64-v8a --platform 30 -o android/app/src/main/jniLibs build --release --locked -p of-mobile
           ls -la android/app/src/main/jniLibs/arm64-v8a
+
+      # What the Java side calls must be exported, and no C++ runtime may be
+      # needed that the APK does not carry (android-activity links c++_static).
+      - name: Check the library's exports and dependencies
+        run: |
+          so=android/app/src/main/jniLibs/arm64-v8a/libof_mobile.so
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$readelf" --needed-libs "$so"
+          if "$readelf" --needed-libs "$so" | grep -q c++_shared; then echo "libc++_shared.so is needed but not packaged"; exit 1; fi
+          for sym in Java_com_google_androidgamesdk_GameActivity_initializeNativeCode Java_com_orderflow_mobile_MainActivity_nativeInsets Java_com_orderflow_mobile_MainActivity_nativeHover; do
+            "$readelf" --dyn-syms --wide "$so" | grep -q " $sym\$" || { echo "missing export: $sym"; exit 1; }
+            echo "exported: $sym"
+          done
 
       - uses: gradle/actions/setup-gradle@v4
         with:

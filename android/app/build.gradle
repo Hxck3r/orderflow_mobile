@@ -5,6 +5,9 @@ plugins {
 android {
     namespace 'com.orderflow.mobile'
     compileSdk 35
+    // The runner image's default NDK (ubuntu-24.04): AGP strips the .so with it
+    // instead of looking for its own default version.
+    ndkVersion '27.3.13750724'
 
     defaultConfig {
         applicationId 'com.orderflow.mobile'
@@ -19,7 +22,23 @@ android {
         }
     }
 
+    // One debug key for every CI build, so a new APK installs over the old one:
+    // with a fresh key per build Android refuses the update, and uninstalling
+    // first wipes the app's data. A debug key only (password "android", like the
+    // SDK's own); a release key will live in the repository's secrets.
+    signingConfigs {
+        debug {
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
         release {
             minifyEnabled false
         }
