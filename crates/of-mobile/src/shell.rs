@@ -9,13 +9,14 @@
 //! insets anyway, so the terminal is drawn into a child `Ui` inside them), a
 //! hovering S Pen, and the soft keyboard's text.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Align2, Rect, RichText, UiBuilder, pos2};
 
 use crate::app::TerminalApp;
 use crate::diag::{Diag, GpuInfo, Screen};
 use crate::gestures::{Gestures, Tuning};
+use crate::ime::Mirror;
 use crate::settings::{self, AppSettings};
 
 /// A stylus hovering over the screen, physical pixels.
@@ -55,17 +56,20 @@ pub struct MobileApp {
     gestures: Gestures,
     diag: Diag,
     platform: Option<Box<dyn Platform>>,
-    /// Insets last handed to egui, in physical pixels.
-    insets_px: Option<[i32; 4]>,
-    /// The keyboard's text as last mirrored into egui, while a field has focus.
-    keyboard: Option<String>,
+    keyboard: Mirror,
     /// The shell's own buttons, last frame: touches there are plain taps.
     own: Vec<Rect>,
+    /// A frame the input hook needs (a long press, the keyboard poll): asked
+    /// for inside the pass, since egui drops requests made before it.
+    repaint_in: Option<Duration>,
+    /// The settings file as last read for the gestures' tuning.
+    settings_seen: Option<SystemTime>,
+    settings_checked: Instant,
 }
 
 impl MobileApp {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: AppSettings, platform: Option<Box<dyn Platform>>) -> Self {
-        let tuning = Tuning { zoom_sensitivity: settings.chart.zoom_sensitivity, ..Tuning::default() };
+        let tuning = Tuning { zoom_sensitivity: settings.chart.zoom_sensitivity, zoom_both_axes: settings.chart.zoom_both_axes, ..Tuning::default() };
         let gpu = cc
             .wgpu_render_state
             .as_ref()
@@ -78,8 +82,40 @@ impl MobileApp {
         if let Some(p) = &platform {
             p.set_waker(&cc.egui_ctx);
         }
+        // A finger's second tap takes longer than a mouse's double click.
+        cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.45);
         let inner = TerminalApp::new(cc, settings);
-        MobileApp { inner, gestures: Gestures::new(tuning), diag: Diag::new(gpu), platform, insets_px: None, keyboard: None, own: Vec::new() }
+        MobileApp {
+            inner,
+            gestures: Gestures::new(tuning),
+            diag: Diag::new(gpu),
+            platform,
+            keyboard: Mirror::Off,
+            own: Vec::new(),
+            repaint_in: None,
+            settings_seen: modified(&settings_file()),
+            settings_checked: Instant::now(),
+        }
+    }
+
+    /// The terminal keeps its settings to itself; the gestures follow the
+    /// zoom settings through the file it saves within a second of a change.
+    fn follow_settings(&mut self) {
+        if self.settings_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.settings_checked = Instant::now();
+        let seen = modified(&settings_file());
+        if seen != self.settings_seen {
+            self.settings_seen = seen;
+            let s = settings::load();
+            self.gestures.tuning.zoom_sensitivity = s.chart.zoom_sensitivity;
+            self.gestures.tuning.zoom_both_axes = s.chart.zoom_both_axes;
+        }
+    }
+
+    fn repaint_within(&mut self, d: Duration) {
+        self.repaint_in = Some(self.repaint_in.map_or(d, |r| r.min(d)));
     }
 
     /// Insets, stylus hover and keyboard text into this frame's input.
@@ -88,11 +124,9 @@ impl MobileApp {
         let ppp = ctx.pixels_per_point();
         if let Some(screen) = p.screen() {
             self.diag.screen = Some(screen);
-            if self.insets_px != Some(screen.insets_px) {
-                self.insets_px = Some(screen.insets_px);
-                let [left, top, right, bottom] = screen.insets_px.map(|v| v.max(0) as f32 / ppp);
-                raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, right, top, bottom }));
-            }
+            // Every frame: points change with the interface scale even when pixels do not.
+            let [left, top, right, bottom] = screen.insets_px.map(|v| v.max(0) as f32 / ppp);
+            raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, right, top, bottom }));
         }
         // First in the list: right after a touch it would read as the touch's emulation.
         match p.take_hover() {
@@ -100,21 +134,14 @@ impl MobileApp {
             Some(Hover::Gone) => raw.events.insert(0, egui::Event::PointerGone),
             None => {}
         }
-        if ctx.egui_wants_keyboard_input() {
-            let before = match self.keyboard.take() {
-                Some(text) => text,
-                None => {
-                    // A field just got focus: start the keyboard's buffer empty.
-                    p.reset_keyboard();
-                    String::new()
-                }
-            };
-            let after = p.keyboard_text().unwrap_or_default();
-            raw.events.extend(crate::ime::diff(&before, &after));
-            self.keyboard = Some(after);
-            ctx.request_repaint_after(KEYBOARD_POLL);
-        } else {
-            self.keyboard = None;
+        let now = raw.time.unwrap_or(0.0);
+        let step = self.keyboard.step(ctx.egui_wants_keyboard_input(), now, || p.keyboard_text().unwrap_or_default());
+        if step.reset {
+            p.reset_keyboard();
+        }
+        raw.events.extend(step.events);
+        if step.poll {
+            self.repaint_within(KEYBOARD_POLL);
         }
     }
 
@@ -164,13 +191,17 @@ impl eframe::App for MobileApp {
         self.diag.input(raw);
         self.platform_input(ctx, raw);
         if let Some(due) = self.gestures.process(raw) {
-            ctx.request_repaint_after(Duration::from_secs_f64(due));
+            self.repaint_within(Duration::from_secs_f64(due));
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let started = Instant::now();
         self.diag.frame_started(started);
+        if let Some(d) = self.repaint_in.take() {
+            ui.ctx().request_repaint_after(d);
+        }
+        self.follow_settings();
         // egui's root Ui spans the whole window whatever the safe-area
         // insets say (egui 0.36 `Context::run_ui`): draw inside them.
         let content = ui.ctx().content_rect();
@@ -214,6 +245,10 @@ pub fn load_settings() -> AppSettings {
 /// The PC version's `settings_path` (private there).
 fn settings_file() -> std::path::PathBuf {
     crate::paths::config_dir().join("settings.json")
+}
+
+fn modified(path: &std::path::Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// The phone's defaults where they differ from the PC's (plan §6).

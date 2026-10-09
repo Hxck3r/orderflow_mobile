@@ -9,10 +9,15 @@ import android.view.View;
 import android.view.WindowManager;
 
 import androidx.activity.OnBackPressedCallback;
+import androidx.annotation.NonNull;
 import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsAnimationCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
+
+import java.util.List;
 
 import com.google.androidgamesdk.GameActivity;
 
@@ -26,7 +31,7 @@ import com.google.androidgamesdk.GameActivity;
  *       background, configuration changes do not recreate it (manifest), and a
  *       real destroy ends the process — winit cannot start a second event loop
  *       in a process, and its Android backend never ends the first one on destroy;</li>
- *   <li>hands the system-bar and camera-cutout insets to Rust;</li>
+ *   <li>hands the system-bar, camera-cutout and keyboard insets to Rust;</li>
  *   <li>hands a hovering S Pen (or a DeX mouse) to Rust: winit drops hover events.</li>
  * </ul>
  */
@@ -55,8 +60,24 @@ public class MainActivity extends GameActivity {
         hideSystemBars();
 
         View decor = getWindow().getDecorView();
-        // A layout listener, not an insets listener: GameActivity may install its own.
+        // A layout listener and an animation callback, not an insets listener:
+        // GameActivity may install its own. With adjustNothing the keyboard
+        // relayouts nothing, so its height comes through the animation callback.
         decor.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> sendInsets());
+        ViewCompat.setWindowInsetsAnimationCallback(decor, new WindowInsetsAnimationCompat.Callback(
+                WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+            @NonNull
+            @Override
+            public WindowInsetsCompat onProgress(@NonNull WindowInsetsCompat insets,
+                    @NonNull List<WindowInsetsAnimationCompat> running) {
+                return insets;
+            }
+
+            @Override
+            public void onEnd(@NonNull WindowInsetsAnimationCompat animation) {
+                sendInsets();
+            }
+        });
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -105,12 +126,12 @@ public class MainActivity extends GameActivity {
 
     @Override
     protected void onDestroy() {
-        if (!isChangingConfigurations()) {
-            // GameActivity's onDestroy waits for android_main to return, which
-            // winit's Android backend never makes it do: end the process instead.
-            Log.i(TAG, "activity destroyed: ending the process");
-            Process.killProcess(Process.myPid());
-        }
+        // GameActivity's onDestroy waits for android_main to return, which
+        // winit's Android backend never makes it do — also when a configuration
+        // change the manifest does not list recreates the activity: end the
+        // process instead, always.
+        Log.i(TAG, "activity destroyed: ending the process");
+        Process.killProcess(Process.myPid());
         super.onDestroy();
     }
 
@@ -127,8 +148,10 @@ public class MainActivity extends GameActivity {
         }
         WindowInsetsCompat insets = WindowInsetsCompat.toWindowInsetsCompat(decor.getRootWindowInsets(), decor);
         Insets i = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+        // The keyboard covers the bottom: the terminal lays out above it.
+        int bottom = Math.max(i.bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom);
         try {
-            nativeInsets(i.left, i.top, i.right, i.bottom);
+            nativeInsets(i.left, i.top, i.right, bottom);
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "nativeInsets is missing from libof_mobile.so", e);
         }

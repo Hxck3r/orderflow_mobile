@@ -21,7 +21,7 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:screenOrientation="fullUser"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden|navigation|locale|layoutDirection|fontScale|colorMode|touchscreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|keyboard|keyboardHidden|navigation|locale|layoutDirection|fontScale|colorMode|touchscreen|fontWeightAdjustment|mcc|mnc|grammaticalGender"
             android:windowSoftInputMode="adjustNothing">
             <!-- GameActivity loads lib<name>.so: crates/of-mobile builds libof_mobile.so. -->
             <meta-data

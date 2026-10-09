@@ -9,7 +9,7 @@
 //! hovering S Pen. The soft keyboard's text is read from GameActivity's own
 //! buffer.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use android_activity::AndroidApp;
@@ -26,10 +26,9 @@ static LAUNCHES: AtomicU32 = AtomicU32::new(0);
 /// Insets from `MainActivity.nativeInsets`, physical pixels.
 static INSETS: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
 static INSETS_KNOWN: AtomicBool = AtomicBool::new(false);
-/// The latest hover from `MainActivity.nativeHover`: x and y bits, and whether one is pending / gone.
-static HOVER_XY: AtomicU64 = AtomicU64::new(0);
-static HOVER_PENDING: AtomicBool = AtomicBool::new(false);
-static HOVER_GONE: AtomicBool = AtomicBool::new(false);
+/// The latest hover from `MainActivity.nativeHover`; the last one wins, so a
+/// pen that leaves right after a move is gone, not stuck at the move.
+static HOVER: Mutex<Option<Hover>> = Mutex::new(None);
 /// Wakes the interface when Java hands something over between frames.
 static WAKER: OnceLock<Mutex<Option<egui::Context>>> = OnceLock::new();
 
@@ -39,8 +38,9 @@ fn wake() {
     }
 }
 
-/// `MainActivity.nativeInsets(left, top, right, bottom)`: system bars and the
-/// camera cutout as the window currently has them, physical pixels.
+/// `MainActivity.nativeInsets(left, top, right, bottom)`: system bars, the
+/// camera cutout and the soft keyboard as the window currently has them,
+/// physical pixels.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_orderflow_mobile_MainActivity_nativeInsets(
     _env: *mut std::ffi::c_void,
@@ -61,11 +61,8 @@ pub extern "system" fn Java_com_orderflow_mobile_MainActivity_nativeInsets(
 /// touching it, window pixels; `gone` when it leaves.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_orderflow_mobile_MainActivity_nativeHover(_env: *mut std::ffi::c_void, _this: *mut std::ffi::c_void, gone: u8, x: f32, y: f32) {
-    if gone != 0 {
-        HOVER_GONE.store(true, Ordering::Release);
-    } else {
-        HOVER_XY.store((u64::from(x.to_bits()) << 32) | u64::from(y.to_bits()), Ordering::Relaxed);
-        HOVER_PENDING.store(true, Ordering::Release);
+    if let Ok(mut hover) = HOVER.lock() {
+        *hover = Some(if gone != 0 { Hover::Gone } else { Hover::At(x, y) });
     }
     wake();
 }
@@ -82,12 +79,7 @@ impl Platform for AndroidPlatform {
     }
 
     fn take_hover(&self) -> Option<Hover> {
-        if HOVER_PENDING.swap(false, Ordering::Acquire) {
-            HOVER_GONE.store(false, Ordering::Relaxed);
-            let bits = HOVER_XY.load(Ordering::Relaxed);
-            return Some(Hover::At(f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32)));
-        }
-        HOVER_GONE.swap(false, Ordering::Acquire).then_some(Hover::Gone)
+        HOVER.lock().ok().and_then(|mut h| h.take())
     }
 
     fn keyboard_text(&self) -> Option<String> {

@@ -4,19 +4,22 @@
 //! egui-winit reports every finger as an `Event::Touch` and, for the first
 //! finger, follows it with emulated `PointerMoved`/`PointerButton`/
 //! `PointerGone` events (egui-winit 0.36.2 `on_touch`). For a touch that
-//! starts on the chart those emulated events are dropped and replaced:
+//! starts in the translated area those emulated events are dropped and
+//! replaced:
 //!
-//! | gesture                         | the chart gets                                   |
-//! |---------------------------------|--------------------------------------------------|
-//! | one finger moved past the slop  | press at the start point, then moves: a drag     |
-//! | one finger lifted in place      | press + release: a click (two make a double click)|
+//! | gesture                         | the PC code gets                                  |
+//! |---------------------------------|---------------------------------------------------|
+//! | one finger moved past the slop  | press where it landed, then moves: a drag         |
+//! | one finger lifted in place      | press + release: a click; a second tap near the   |
+//! |                                 | first is put on the first's spot: a double click  |
 //! | one finger held in place        | crosshair: a hover without a press, lifted above  |
 //! |                                 | the finger, kept after the finger is up           |
-//! | two fingers apart / together    | `MouseWheel` (time) and Ctrl+`MouseWheel` (price) |
+//! | two fingers apart / together    | `MouseWheel` (time) and Ctrl+`MouseWheel` (price),|
+//! |                                 | at most one per axis a frame, past a dead zone    |
 //!
-//! Touches elsewhere (settings, the shell's own buttons) keep egui-winit's
-//! emulation. A stylus hovering over the screen arrives as plain pointer
-//! events without touches and is left alone: it hovers like a mouse.
+//! Touches on the shell's own buttons keep egui-winit's emulation. A stylus
+//! hovering over the screen arrives as plain pointer events without touches
+//! and is left alone: it hovers like a mouse.
 
 use eframe::egui::{Event, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchId, TouchPhase, Vec2, pos2};
 
@@ -36,13 +39,32 @@ pub struct Tuning {
     pub lift: f32,
     /// The chart's `zoom_sensitivity` setting, to undo its scaling of wheel points.
     pub zoom_sensitivity: f32,
+    /// The chart's `zoom_both_axes` setting: its plain wheel zooms price too.
+    pub zoom_both_axes: bool,
     /// Below this span (points) a pinch axis is too short to measure a ratio on.
     pub min_span: f32,
+    /// A pinch is sent once it has zoomed an axis by this much (ln of the
+    /// ratio): finger jitter must not move a stepped scale (the `Стакан`
+    /// tab changes its price step one notch per wheel event).
+    pub pinch_dead_zone: f32,
+    /// A second tap this soon and this close to the first is a double click.
+    pub double_tap_s: f64,
+    pub double_tap_dist: f32,
 }
 
 impl Default for Tuning {
     fn default() -> Self {
-        Tuning { slop: 10.0, long_press: 0.45, lift: 64.0, zoom_sensitivity: 1.0, min_span: 48.0 }
+        Tuning {
+            slop: 10.0,
+            long_press: 0.45,
+            lift: 64.0,
+            zoom_sensitivity: 1.0,
+            zoom_both_axes: false,
+            min_span: 48.0,
+            pinch_dead_zone: 0.05,
+            double_tap_s: 0.4,
+            double_tap_dist: 40.0,
+        }
     }
 }
 
@@ -69,10 +91,12 @@ enum Mode {
         id: TouchId,
         last: Pos2,
     },
+    /// `zoom`: ln of the zoom per axis the fingers made and the wheel has not sent yet.
     Pinch {
         a: (TouchId, Pos2),
         b: (TouchId, Pos2),
         axes: PinchAxes,
+        zoom: Vec2,
     },
     /// The crosshair is on; `finger` moves it, or it rests where it was left.
     Crosshair {
@@ -95,6 +119,7 @@ struct CrossFinger {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub taps: u64,
+    pub double_taps: u64,
     pub drags: u64,
     pub pinches: u64,
     pub crosshairs: u64,
@@ -106,14 +131,17 @@ pub struct Counters {
 pub struct Gestures {
     pub tuning: Tuning,
     mode: Mode,
-    /// Fingers down that this translator owns (started on the chart).
+    /// Fingers down that this translator owns.
     down: Vec<TouchId>,
     /// Fingers down that egui-winit's emulation keeps.
     passthrough: Vec<TouchId>,
-    /// Where chart gestures apply and, inside it, the shell's own widgets.
-    chart: Option<Rect>,
+    /// Where gestures are translated and, inside it, the shell's own widgets.
+    area: Option<Rect>,
     exempt: Vec<Rect>,
+    /// Events for the next frame.
     queued: Vec<Event>,
+    /// Where and when the last tap was sent, for a double tap.
+    last_tap: Option<(Pos2, f64)>,
     /// The keyboard's modifiers as the last `ModifiersChanged` left them
     /// (a keyboard in DeX); synthesized pointer events carry them.
     modifiers: Modifiers,
@@ -133,17 +161,18 @@ impl Gestures {
             mode: Mode::Idle,
             down: Vec::new(),
             passthrough: Vec::new(),
-            chart: None,
+            area: None,
             exempt: Vec::new(),
             queued: Vec::new(),
+            last_tap: None,
             modifiers: Modifiers::NONE,
             counters: Counters::default(),
         }
     }
 
-    /// The chart's area and the shell's widgets over it, from the last frame.
-    pub fn set_areas(&mut self, chart: Option<Rect>, exempt: Vec<Rect>) {
-        self.chart = chart;
+    /// The translated area and the shell's widgets over it, from the last frame.
+    pub fn set_areas(&mut self, area: Option<Rect>, exempt: Vec<Rect>) {
+        self.area = area;
         self.exempt = exempt;
     }
 
@@ -154,16 +183,17 @@ impl Gestures {
         }
     }
 
-    /// A right click at the crosshair on the next frame: the chart's context menu.
+    /// A right click at the crosshair on the next frame: the chart's context
+    /// menu. The crosshair goes, so the next tap reaches the menu.
     pub fn context_menu_at_crosshair(&mut self) {
         if let Some(at) = self.crosshair() {
-            let none = Modifiers::NONE;
+            let modifiers = self.modifiers;
             self.queued.extend([
                 Event::PointerMoved(at),
-                Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed: true, modifiers: none },
-                Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed: false, modifiers: none },
-                Event::PointerMoved(at),
+                Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed: true, modifiers },
+                Event::PointerButton { pos: at, button: PointerButton::Secondary, pressed: false, modifiers },
             ]);
+            self.mode = if self.down.is_empty() { Mode::Idle } else { Mode::Settling };
         }
     }
 
@@ -174,17 +204,20 @@ impl Gestures {
         }
     }
 
-    /// Rewrites this frame's input. Returns how many seconds from `now` the
-    /// next frame is needed for a pending long press, if one is pending.
+    /// Rewrites this frame's input. Returns how many seconds from now the
+    /// next frame is needed (a pending long press, or events queued for it).
     pub fn process(&mut self, raw: &mut RawInput) -> Option<f64> {
         let now = raw.time.unwrap_or(0.0);
         let mut out = std::mem::take(&mut self.queued);
+        // A finger that rested past the long press is a crosshair before
+        // whatever it does next: its lifting must not read as a tap.
+        self.tick(now, &mut out);
         // The touch whose emulated pointer events follow, and whether we own it.
         let mut emulated_ours: Option<bool> = None;
         for event in std::mem::take(&mut raw.events) {
             match event {
                 Event::Touch { id, phase, pos, .. } => {
-                    let ours = self.touch(id, phase, pos, now, self.modifiers, &mut out);
+                    let ours = self.touch(id, phase, pos, now, &mut out);
                     emulated_ours = Some(ours);
                     out.push(event);
                 }
@@ -206,7 +239,11 @@ impl Gestures {
             }
         }
         self.tick(now, &mut out);
+        self.send_zoom(&mut out);
         raw.events = out;
+        if !self.queued.is_empty() {
+            return Some(0.0);
+        }
         match self.mode {
             Mode::Pending { t0, .. } => Some((t0 + self.tuning.long_press - now).max(0.0)),
             _ => None,
@@ -227,26 +264,27 @@ impl Gestures {
 
     fn lifted(&self, finger: Pos2) -> Pos2 {
         let y = finger.y - self.tuning.lift;
-        let top = self.chart.map_or(0.0, |r| r.top());
+        let top = self.area.map_or(0.0, |r| r.top());
         pos2(finger.x, y.max(top + 1.0))
     }
 
-    fn on_chart(&self, pos: Pos2) -> bool {
-        self.chart.is_some_and(|r| r.contains(pos)) && !self.exempt.iter().any(|r| r.contains(pos))
+    fn translated(&self, pos: Pos2) -> bool {
+        self.area.is_some_and(|r| r.contains(pos)) && !self.exempt.iter().any(|r| r.contains(pos))
     }
 
     /// Handles one touch event; returns whether this translator owns the finger.
-    fn touch(&mut self, id: TouchId, phase: TouchPhase, pos: Pos2, now: f64, modifiers: Modifiers, out: &mut Vec<Event>) -> bool {
+    fn touch(&mut self, id: TouchId, phase: TouchPhase, pos: Pos2, now: f64, out: &mut Vec<Event>) -> bool {
+        let modifiers = self.modifiers;
         match phase {
             TouchPhase::Start => {
                 // A finger joins whoever owns the fingers already down; a lone
-                // finger is ours when it lands on the chart.
+                // finger is ours when it lands in the translated area.
                 let ours = if !self.down.is_empty() {
                     true
                 } else if !self.passthrough.is_empty() {
                     false
                 } else {
-                    self.on_chart(pos)
+                    self.translated(pos)
                 };
                 if !ours {
                     self.passthrough.push(id);
@@ -275,7 +313,7 @@ impl Gestures {
                 }
                 let Some(i) = self.down.iter().position(|&t| t == id) else { return false };
                 self.down.swap_remove(i);
-                self.ended(id, pos, phase == TouchPhase::Cancel, modifiers, out);
+                self.ended(id, pos, now, phase == TouchPhase::Cancel, modifiers, out);
                 true
             }
         }
@@ -289,6 +327,8 @@ impl Gestures {
                 pinch((first, last), (id, pos))
             }
             Mode::Dragging { id: first, last } => {
+                // The move queued for the drag must not land after its release.
+                self.queued.clear();
                 out.push(Event::PointerButton { pos: last, button: PointerButton::Primary, pressed: false, modifiers });
                 self.counters.pinches += 1;
                 pinch((first, last), (id, pos))
@@ -304,19 +344,27 @@ impl Gestures {
             Mode::Pending { id: p, start, t0, .. } if p == id => {
                 if start.distance(pos) > self.tuning.slop {
                     self.counters.drags += 1;
+                    // The press goes where the finger landed, in a frame of its
+                    // own: egui hit-tests once a frame, at the last position,
+                    // and a thin handle (a pane splitter) must get the drag.
                     out.push(Event::PointerMoved(start));
                     out.push(Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers });
-                    out.push(Event::PointerMoved(pos));
+                    self.queued.push(Event::PointerMoved(pos));
                     self.mode = Mode::Dragging { id, last: pos };
                 } else {
                     self.mode = Mode::Pending { id, start, last: pos, t0 };
                 }
             }
             Mode::Dragging { id: d, .. } if d == id => {
-                out.push(Event::PointerMoved(pos));
+                if self.queued.is_empty() {
+                    out.push(Event::PointerMoved(pos));
+                } else {
+                    // Still the frame of the press: move the queued step on instead.
+                    self.queued = vec![Event::PointerMoved(pos)];
+                }
                 self.mode = Mode::Dragging { id, last: pos };
             }
-            Mode::Pinch { a, b, axes } => {
+            Mode::Pinch { a, b, axes, zoom } => {
                 let (na, nb) = if a.0 == id {
                     ((id, pos), b)
                 } else if b.0 == id {
@@ -324,8 +372,8 @@ impl Gestures {
                 } else {
                     return;
                 };
-                self.zoom(a.1, b.1, na.1, nb.1, axes, out);
-                self.mode = Mode::Pinch { a: na, b: nb, axes };
+                let zoom = zoom + self.span_zoom(a.1, b.1, na.1, nb.1);
+                self.mode = Mode::Pinch { a: na, b: nb, axes, zoom };
             }
             Mode::Crosshair { at, finger: Some(f) } if f.id == id => {
                 // The crosshair follows the finger by its moves, so taking it
@@ -341,24 +389,41 @@ impl Gestures {
         }
     }
 
-    fn ended(&mut self, id: TouchId, pos: Pos2, cancelled: bool, modifiers: Modifiers, out: &mut Vec<Event>) {
+    fn ended(&mut self, id: TouchId, pos: Pos2, now: f64, cancelled: bool, modifiers: Modifiers, out: &mut Vec<Event>) {
         let all_up = self.down.is_empty();
         self.mode = match self.mode {
             Mode::Pending { id: p, start, .. } if p == id => {
                 if !cancelled {
+                    // egui counts a double click only within a few points of the
+                    // first; a finger's second tap lands further away.
+                    let at = match self.last_tap {
+                        Some((first, t)) if now - t <= self.tuning.double_tap_s && first.distance(start) <= self.tuning.double_tap_dist => {
+                            self.counters.double_taps += 1;
+                            self.last_tap = None;
+                            first
+                        }
+                        _ => {
+                            self.last_tap = Some((start, now));
+                            start
+                        }
+                    };
                     self.counters.taps += 1;
-                    out.push(Event::PointerMoved(start));
-                    out.push(Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers });
-                    out.push(Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: false, modifiers });
+                    out.push(Event::PointerMoved(at));
+                    out.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers });
+                    out.push(Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers });
                 }
                 out.push(Event::PointerGone);
                 Mode::Idle
             }
             Mode::Dragging { id: d, .. } if d == id => {
+                // A step still queued goes before the release.
+                out.append(&mut self.queued);
                 out.push(Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers });
                 out.push(Event::PointerGone);
                 Mode::Idle
             }
+            // What the dead zone still holds (under 5 %) is dropped: on a
+            // stepped scale it would be one more notch the fingers never made.
             Mode::Pinch { .. } => {
                 out.push(Event::PointerGone);
                 if all_up { Mode::Idle } else { Mode::Settling }
@@ -378,38 +443,42 @@ impl Gestures {
     }
 
     fn clamp(&self, p: Pos2) -> Pos2 {
-        match self.chart {
+        match self.area {
             Some(r) => pos2(p.x.clamp(r.left() + 1.0, r.right() - 1.0), p.y.clamp(r.top() + 1.0, r.bottom() - 1.0)),
             None => p,
         }
     }
 
-    /// Wheel events that give the chart the zoom the fingers made.
-    fn zoom(&self, a0: Pos2, b0: Pos2, a1: Pos2, b1: Pos2, axes: PinchAxes, out: &mut Vec<Event>) {
-        let span0 = (b0 - a0).abs();
-        let span1 = (b1 - a1).abs();
+    /// ln of the zoom per axis between two finger positions.
+    fn span_zoom(&self, a0: Pos2, b0: Pos2, a1: Pos2, b1: Pos2) -> Vec2 {
         let min = self.tuning.min_span;
+        let (s0, s1) = ((b0 - a0).abs(), (b1 - a1).abs());
+        Vec2::new((s1.x.max(min) / s0.x.max(min)).ln(), (s1.y.max(min) / s0.y.max(min)).ln())
+    }
+
+    /// Wheel events for the pinch's unsent zoom, an axis once it passes the dead zone.
+    fn send_zoom(&mut self, out: &mut Vec<Event>) {
+        let Mode::Pinch { a, b, axes, mut zoom } = self.mode else { return };
+        let dead_zone = self.tuning.pinch_dead_zone;
         let sens = self.tuning.zoom_sensitivity.max(0.05);
-        let center = a1 + (b1 - a1) * 0.5;
-        let ratio = |s0: f32, s1: f32| s1.max(min) / s0.max(min);
-        let mut events = Vec::with_capacity(3);
-        if axes != PinchAxes::Price {
-            let dy = ratio(span0.x, span1.x).ln() / (WHEEL_TIME * sens);
-            if dy.abs() > 0.01 {
-                events.push(wheel(Vec2::new(0.0, dy), Modifiers::NONE));
-            }
+        let time = axes != PinchAxes::Price;
+        // With `zoom_both_axes` the plain wheel zooms price too: never add Ctrl to it.
+        let price = axes == PinchAxes::Price || (axes == PinchAxes::Both && !self.tuning.zoom_both_axes);
+        let mut events = Vec::with_capacity(2);
+        if time && zoom.x.abs() > dead_zone {
+            events.push(wheel(Vec2::new(0.0, zoom.x / (WHEEL_TIME * sens)), Modifiers::NONE));
+            zoom.x = 0.0;
         }
-        if axes != PinchAxes::Time {
-            let dy = ratio(span0.y, span1.y).ln() / (WHEEL_PRICE * sens);
-            if dy.abs() > 0.01 {
-                events.push(wheel(Vec2::new(0.0, dy), Modifiers::CTRL));
-            }
+        if price && zoom.y.abs() > dead_zone {
+            events.push(wheel(Vec2::new(0.0, zoom.y / (WHEEL_PRICE * sens)), Modifiers::CTRL));
+            zoom.y = 0.0;
         }
         if !events.is_empty() {
             // The chart zooms around the pointer: put it between the fingers.
-            out.push(Event::PointerMoved(center));
+            out.push(Event::PointerMoved(a.1 + (b.1 - a.1) * 0.5));
             out.extend(events);
         }
+        self.mode = Mode::Pinch { a, b, axes, zoom };
     }
 }
 
@@ -422,7 +491,7 @@ fn pinch(a: (TouchId, Pos2), b: (TouchId, Pos2)) -> Mode {
     } else {
         PinchAxes::Both
     };
-    Mode::Pinch { a, b, axes }
+    Mode::Pinch { a, b, axes, zoom: Vec2::ZERO }
 }
 
 fn wheel(delta: Vec2, modifiers: Modifiers) -> Event {
@@ -434,13 +503,13 @@ mod tests {
     use super::*;
     use eframe::egui::TouchDeviceId;
 
-    fn chart() -> Rect {
+    fn area() -> Rect {
         Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 400.0))
     }
 
     fn gestures() -> Gestures {
         let mut g = Gestures::default();
-        g.set_areas(Some(chart()), vec![Rect::from_min_max(pos2(760.0, 0.0), pos2(800.0, 40.0))]);
+        g.set_areas(Some(area()), vec![Rect::from_min_max(pos2(760.0, 0.0), pos2(800.0, 40.0))]);
         g
     }
 
@@ -472,6 +541,10 @@ mod tests {
         events.iter().filter_map(|e| if let Event::PointerButton { button, pressed, .. } = e { Some((*button, *pressed)) } else { None }).collect()
     }
 
+    fn wheels(events: &[Event]) -> Vec<(f32, Modifiers)> {
+        events.iter().filter_map(|e| if let Event::MouseWheel { delta, modifiers, .. } = e { Some((delta.y, *modifiers)) } else { None }).collect()
+    }
+
     #[test]
     fn a_quick_tap_is_a_click_at_the_touch_point() {
         let mut g = gestures();
@@ -487,15 +560,40 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_finger_drags_from_where_it_landed() {
+    fn a_second_tap_nearby_lands_on_the_first_for_a_double_click() {
+        let mut g = gestures();
+        frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(100.0, 100.0), true));
+        frame(&mut g, 0.08, winit(1, TouchPhase::End, pos2(100.0, 100.0), true));
+        frame(&mut g, 0.2, winit(2, TouchPhase::Start, pos2(118.0, 109.0), true));
+        let (out, _) = frame(&mut g, 0.28, winit(2, TouchPhase::End, pos2(118.0, 109.0), true));
+        assert!(out.iter().all(|e| !matches!(e, Event::PointerButton { pos, .. } if *pos != pos2(100.0, 100.0))), "{out:?}");
+        assert_eq!(g.counters.double_taps, 1);
+        // A third tap starts a new pair, and a far or late one is a plain tap.
+        frame(&mut g, 0.5, winit(3, TouchPhase::Start, pos2(300.0, 100.0), true));
+        let (out, _) = frame(&mut g, 0.55, winit(3, TouchPhase::End, pos2(300.0, 100.0), true));
+        assert!(matches!(out[1], Event::PointerButton { pos, .. } if pos == pos2(300.0, 100.0)));
+        frame(&mut g, 1.5, winit(4, TouchPhase::Start, pos2(305.0, 100.0), true));
+        frame(&mut g, 1.55, winit(4, TouchPhase::End, pos2(305.0, 100.0), true));
+        assert_eq!(g.counters.double_taps, 1);
+    }
+
+    #[test]
+    fn a_moved_finger_presses_where_it_landed_and_moves_a_frame_later() {
         let mut g = gestures();
         frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(100.0, 100.0), true));
         let (out, _) = frame(&mut g, 0.05, winit(1, TouchPhase::Move, pos2(104.0, 100.0), true));
         assert!(out.is_empty(), "inside the slop: {out:?}");
-        let (out, _) = frame(&mut g, 0.1, winit(1, TouchPhase::Move, pos2(150.0, 100.0), true));
-        assert_eq!(out[0], Event::PointerMoved(pos2(100.0, 100.0)));
-        assert_eq!(presses(&out), [(PointerButton::Primary, true)]);
-        assert_eq!(out.last(), Some(&Event::PointerMoved(pos2(150.0, 100.0))));
+        let (out, due) = frame(&mut g, 0.1, winit(1, TouchPhase::Move, pos2(150.0, 100.0), true));
+        assert_eq!(
+            out,
+            vec![
+                Event::PointerMoved(pos2(100.0, 100.0)),
+                Event::PointerButton { pos: pos2(100.0, 100.0), button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+            ]
+        );
+        assert_eq!(due, Some(0.0), "the queued move needs a frame");
+        let (out, _) = frame(&mut g, 0.11, vec![]);
+        assert_eq!(out, vec![Event::PointerMoved(pos2(150.0, 100.0))]);
         // Held still long after: still a drag, no crosshair.
         let (out, due) = frame(&mut g, 2.0, vec![]);
         assert!(out.is_empty());
@@ -503,6 +601,16 @@ mod tests {
         let (out, _) = frame(&mut g, 2.1, winit(1, TouchPhase::End, pos2(150.0, 100.0), true));
         assert_eq!(presses(&out), [(PointerButton::Primary, false)]);
         assert_eq!(g.crosshair(), None);
+    }
+
+    #[test]
+    fn a_drag_released_in_the_frame_of_its_press_still_moves_first() {
+        let mut g = gestures();
+        frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(100.0, 100.0), true));
+        frame(&mut g, 0.05, winit(1, TouchPhase::Move, pos2(150.0, 100.0), true));
+        let (out, _) = frame(&mut g, 0.06, winit(1, TouchPhase::End, pos2(150.0, 100.0), true));
+        assert_eq!(out[0], Event::PointerMoved(pos2(150.0, 100.0)));
+        assert_eq!(presses(&out), [(PointerButton::Primary, false)]);
     }
 
     #[test]
@@ -527,7 +635,18 @@ mod tests {
     }
 
     #[test]
-    fn the_crosshair_never_leaves_the_chart_upwards() {
+    fn a_long_hold_lifted_before_any_frame_is_a_crosshair_not_a_click() {
+        let mut g = gestures();
+        frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(200.0, 200.0), true));
+        // The timer's frame never came: the next one brings the finger's lifting.
+        let (out, _) = frame(&mut g, 1.0, winit(1, TouchPhase::End, pos2(200.0, 200.0), true));
+        assert!(presses(&out).is_empty(), "{out:?}");
+        assert!(g.crosshair().is_some());
+        assert_eq!(g.counters.taps, 0);
+    }
+
+    #[test]
+    fn the_crosshair_never_leaves_the_area_upwards() {
         let mut g = gestures();
         frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(50.0, 20.0), true));
         frame(&mut g, 0.5, vec![]);
@@ -542,11 +661,11 @@ mod tests {
         let (out, _) = frame(&mut g, 0.05, winit(2, TouchPhase::Move, pos2(500.0, 205.0), false));
         assert!(presses(&out).is_empty(), "a pinch never presses: {out:?}");
         assert_eq!(out[0], Event::PointerMoved(pos2(400.0, 202.5)));
-        let Event::MouseWheel { delta, modifiers, .. } = out[1] else { panic!("{out:?}") };
-        assert_eq!(modifiers, Modifiers::NONE);
-        assert_eq!(out.len(), 2, "time only: {out:?}");
+        let w = wheels(&out);
+        assert_eq!(w.len(), 1, "time only: {out:?}");
+        assert_eq!(w[0].1, Modifiers::NONE);
         // The chart's own formula gives back the fingers' ratio (100 → 200).
-        assert!(((delta.y * WHEEL_TIME).exp() - 2.0).abs() < 1e-3, "{delta:?}");
+        assert!(((w[0].0 * WHEEL_TIME).exp() - 2.0).abs() < 1e-3, "{w:?}");
         assert_eq!(g.counters.pinches, 1);
     }
 
@@ -556,11 +675,44 @@ mod tests {
         frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(300.0, 100.0), true));
         frame(&mut g, 0.02, winit(2, TouchPhase::Start, pos2(305.0, 200.0), false));
         let (out, _) = frame(&mut g, 0.05, winit(1, TouchPhase::Move, pos2(300.0, 50.0), true));
-        let wheels: Vec<_> = out.iter().filter(|e| matches!(e, Event::MouseWheel { .. })).collect();
-        assert_eq!(wheels.len(), 1);
-        let Event::MouseWheel { delta, modifiers, .. } = wheels[0] else { unreachable!() };
-        assert_eq!(*modifiers, Modifiers::CTRL);
-        assert!(((delta.y * WHEEL_PRICE).exp() - 1.5).abs() < 1e-3, "{delta:?}");
+        let w = wheels(&out);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].1, Modifiers::CTRL);
+        assert!(((w[0].0 * WHEEL_PRICE).exp() - 1.5).abs() < 1e-3, "{w:?}");
+    }
+
+    #[test]
+    fn jittering_fingers_send_nothing_and_many_moves_send_one_wheel_a_frame() {
+        let mut g = gestures();
+        frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(300.0, 100.0), true));
+        frame(&mut g, 0.02, winit(2, TouchPhase::Start, pos2(305.0, 300.0), false));
+        // A pixel of span jitter, back and forth, many times: inside the dead zone.
+        for i in 0..20 {
+            let y = if i % 2 == 0 { 301.0 } else { 300.0 };
+            let (out, _) = frame(&mut g, 0.03 + i as f64 * 0.008, winit(2, TouchPhase::Move, pos2(305.0, y), false));
+            assert!(wheels(&out).is_empty(), "{out:?}");
+        }
+        // Several real moves in one frame: one Ctrl wheel with all of them.
+        let mut events = Vec::new();
+        for y in [320.0, 340.0, 360.0, 400.0] {
+            events.extend(winit(2, TouchPhase::Move, pos2(305.0, y), false));
+        }
+        let (out, _) = frame(&mut g, 0.3, events);
+        let w = wheels(&out);
+        assert_eq!(w.len(), 1, "{out:?}");
+        assert!(((w[0].0 * WHEEL_PRICE).exp() - 1.5).abs() < 1e-3, "{w:?}");
+    }
+
+    #[test]
+    fn with_zoom_both_axes_a_pinch_never_adds_a_ctrl_wheel_to_the_plain_one() {
+        let mut g = gestures();
+        g.tuning.zoom_both_axes = true;
+        frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(300.0, 100.0), true));
+        frame(&mut g, 0.02, winit(2, TouchPhase::Start, pos2(400.0, 200.0), false));
+        let (out, _) = frame(&mut g, 0.05, winit(2, TouchPhase::Move, pos2(500.0, 300.0), false));
+        let w = wheels(&out);
+        assert_eq!(w.len(), 1, "{out:?}");
+        assert_eq!(w[0].1, Modifiers::NONE);
     }
 
     #[test]
@@ -583,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn touches_off_the_chart_or_on_shell_buttons_keep_egui_emulation() {
+    fn touches_on_shell_buttons_or_outside_keep_egui_emulation() {
         let mut g = gestures();
         for p in [pos2(100.0, 450.0), pos2(780.0, 20.0)] {
             let start = winit(1, TouchPhase::Start, p, true);
@@ -597,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_touch_off_the_chart_releases_the_button() {
+    fn a_cancelled_touch_on_a_shell_button_releases_the_button() {
         let mut g = gestures();
         let p = pos2(100.0, 450.0);
         frame(&mut g, 0.0, winit(1, TouchPhase::Start, p, true));
@@ -614,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn the_context_menu_is_a_right_click_at_the_crosshair() {
+    fn the_context_menu_is_a_right_click_at_the_crosshair_and_frees_the_next_tap() {
         let mut g = gestures();
         frame(&mut g, 0.0, winit(1, TouchPhase::Start, pos2(200.0, 200.0), true));
         frame(&mut g, 0.5, vec![]);
@@ -622,7 +774,11 @@ mod tests {
         // Lifting the finger of the long press keeps the crosshair.
         assert_eq!(g.crosshair(), Some(pos2(200.0, 200.0 - g.tuning.lift)));
         g.context_menu_at_crosshair();
-        let (out, _) = frame(&mut g, 0.55, vec![]);
+        let (out, _) = frame(&mut g, 0.65, vec![]);
         assert_eq!(presses(&out), [(PointerButton::Secondary, true), (PointerButton::Secondary, false)]);
+        // The next tap is a click (on the menu), not "put the crosshair away".
+        frame(&mut g, 1.0, winit(2, TouchPhase::Start, pos2(220.0, 150.0), true));
+        let (out, _) = frame(&mut g, 1.05, winit(2, TouchPhase::End, pos2(220.0, 150.0), true));
+        assert_eq!(presses(&out), [(PointerButton::Primary, true), (PointerButton::Primary, false)]);
     }
 }

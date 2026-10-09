@@ -8,6 +8,74 @@
 
 use eframe::egui::{Event, Key, Modifiers};
 
+/// How long a reset of the keyboard's buffer may take to show before the
+/// buffer is taken as it is.
+const RESET_WAIT_S: f64 = 0.5;
+
+/// The keyboard's buffer as mirrored into egui, across frames.
+///
+/// Resetting the buffer goes through the Java side and lands a frame or more
+/// later: a read straight after a reset still returns the previous field's
+/// text, which must not be typed into the new one. So a reset is followed by
+/// reads that are ignored until the buffer reads back empty.
+#[derive(Debug, Default, PartialEq)]
+pub enum Mirror {
+    #[default]
+    Off,
+    Resetting {
+        since: f64,
+    },
+    On(String),
+}
+
+/// What a frame must do with the keyboard.
+#[derive(Debug, Default, PartialEq)]
+pub struct Step {
+    /// Empty the keyboard's buffer.
+    pub reset: bool,
+    /// Events for egui.
+    pub events: Vec<Event>,
+    /// Whether the buffer must be read again soon (a field has focus).
+    pub poll: bool,
+}
+
+impl Mirror {
+    /// One frame: `focused` says whether a text field has the keyboard,
+    /// `read` returns the buffer (called only when needed).
+    pub fn step(&mut self, focused: bool, now: f64, read: impl FnOnce() -> String) -> Step {
+        if !focused {
+            // The field lost focus: its text must not outlive it in the buffer.
+            let reset = *self != Mirror::Off;
+            *self = Mirror::Off;
+            return Step { reset, ..Step::default() };
+        }
+        match std::mem::take(self) {
+            Mirror::Off => {
+                *self = Mirror::Resetting { since: now };
+                Step { reset: true, poll: true, ..Step::default() }
+            }
+            Mirror::Resetting { since } => {
+                let text = read();
+                *self = if text.is_empty() {
+                    Mirror::On(text)
+                } else if now - since >= RESET_WAIT_S {
+                    // The reset never showed: take the buffer as the start.
+                    Mirror::On(text)
+                } else {
+                    Mirror::Resetting { since }
+                };
+                Step { poll: true, ..Step::default() }
+            }
+            Mirror::On(before) => {
+                let after = read();
+                let events = diff(&before, &after);
+                *self = Mirror::On(after);
+                Step { events, poll: true, ..Step::default() }
+            }
+        }
+    }
+}
+
 /// Events that turn `before` into `after`.
 pub fn diff(before: &str, after: &str) -> Vec<Event> {
     let common = before.chars().zip(after.chars()).take_while(|(a, b)| a == b).count();
@@ -76,6 +144,37 @@ mod tests {
     fn a_new_line_is_the_enter_key() {
         assert_eq!(keys(&diff("76", "76012\n")), ["'012'", "Enter"]);
         assert_eq!(keys(&diff("", "\n")), ["Enter"]);
+    }
+
+    #[test]
+    fn a_new_field_ignores_the_previous_fields_text_until_the_reset_lands() {
+        let mut m = Mirror::default();
+        let step = m.step(true, 0.0, || panic!("not read on focus"));
+        assert!(step.reset && step.poll && step.events.is_empty());
+        // The reset has not landed: the old text is still there and is not typed.
+        let step = m.step(true, 0.04, || "BTC".into());
+        assert!(step.events.is_empty() && !step.reset);
+        let step = m.step(true, 0.08, String::new);
+        assert!(step.events.is_empty());
+        assert_eq!(m, Mirror::On(String::new()));
+        assert_eq!(keys(&m.step(true, 0.12, || "7".into()).events), ["'7'"]);
+    }
+
+    #[test]
+    fn a_reset_that_never_lands_takes_the_buffer_as_it_is() {
+        let mut m = Mirror::default();
+        m.step(true, 0.0, String::new);
+        m.step(true, 0.6, || "x".into());
+        assert_eq!(m, Mirror::On("x".into()));
+        assert_eq!(keys(&m.step(true, 0.64, || "xy".into()).events), ["'y'"]);
+    }
+
+    #[test]
+    fn losing_focus_resets_the_buffer_once() {
+        let mut m = Mirror::On("abc".into());
+        let step = m.step(false, 1.0, || panic!("not read without focus"));
+        assert!(step.reset && !step.poll);
+        assert!(!m.step(false, 1.04, || panic!()).reset);
     }
 
     #[test]
