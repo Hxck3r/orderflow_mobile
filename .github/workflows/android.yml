@@ -1,9 +1,9 @@
 # Checks the Rust code on Linux and builds the APK for the phone. The PC
 # version comes in as the submodule upstream/orderflow at its pinned commit.
-# That repository is private (since October 2026): the checkout reads it with
-# the UPSTREAM_TOKEN secret, a fine-grained token with Contents: read on
-# Hxck3r/orderflow (docs/ANDROID_PLAN.md §3.1); the workflow's own token
-# cannot reach another private repository.
+# Should that repository turn private, the checkout reads it with the
+# UPSTREAM_TOKEN secret, a fine-grained token with Contents: read on
+# Hxck3r/orderflow (docs/ANDROID_PLAN.md §3.1): the workflow's own token
+# cannot reach another private repository. Without the secret it is that token.
 #
 # The APK is signed with the repository's debug key (android/app/debug.keystore),
 # so each build installs over the last, and lands in the run's artifacts
