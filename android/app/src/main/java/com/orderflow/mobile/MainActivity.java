@@ -1,5 +1,7 @@
 package com.orderflow.mobile;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.os.Bundle;
 import android.os.Process;
 import android.util.Log;
@@ -30,12 +32,14 @@ import com.google.androidgamesdk.GameActivity;
  * does what Rust cannot reach through winit 0.30 (crates/of-mobile/src/android.rs):
  *
  * <ul>
- *   <li>keeps one activity for the process: back moves the app to the
- *       background, configuration changes do not recreate it (manifest), and a
- *       real destroy ends the process — winit cannot start a second event loop
- *       in a process, and its Android backend never ends the first one on destroy;</li>
+ *   <li>keeps one activity for the process: back closes what the terminal
+ *       has open and with nothing open moves the app to the background,
+ *       configuration changes do not recreate it (manifest), and a real
+ *       destroy ends the process — winit cannot start a second event loop in a
+ *       process, and its Android backend never ends the first one on destroy;</li>
  *   <li>hands the system-bar, camera-cutout and keyboard insets to Rust;</li>
- *   <li>hands a hovering S Pen (or a DeX mouse) to Rust: winit drops hover events.</li>
+ *   <li>hands a hovering S Pen (or a DeX mouse) to Rust: winit drops hover events;</li>
+ *   <li>puts what the terminal copies on the system clipboard ({@link #copyToClipboard}).</li>
  * </ul>
  */
 public class MainActivity extends GameActivity {
@@ -47,6 +51,9 @@ public class MainActivity extends GameActivity {
     private native void nativeInsets(int left, int top, int right, int bottom);
 
     private native void nativeHover(boolean gone, float x, float y);
+
+    /** True when the terminal has something open and closes it itself. */
+    private native boolean nativeBack();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -86,7 +93,7 @@ public class MainActivity extends GameActivity {
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                moveTaskToBack(true);
+                back();
             }
         });
     }
@@ -102,10 +109,12 @@ public class MainActivity extends GameActivity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
-        // Back never reaches the terminal (it would end its event loop): the app goes to the background.
+        // Back never reaches winit (it would end its event loop): the terminal
+        // closes a menu, a field's focus, the diagnostics or the crosshair, and
+        // with nothing open the app goes to the background.
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
             if (event.getAction() == KeyEvent.ACTION_UP) {
-                moveTaskToBack(true);
+                back();
             }
             return true;
         }
@@ -195,6 +204,32 @@ public class MainActivity extends GameActivity {
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "nativeInsets is missing from libof_mobile.so", e);
         }
+    }
+
+    private void back() {
+        boolean closed = false;
+        try {
+            closed = nativeBack();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "nativeBack is missing from libof_mobile.so", e);
+        }
+        if (!closed) {
+            moveTaskToBack(true);
+        }
+    }
+
+    /**
+     * Called from Rust (android.rs {@code copy_to_clipboard}) with what the
+     * terminal copied, such as the chart's «Копировать цену»: egui keeps it
+     * inside the app only.
+     */
+    public void copyToClipboard(String text) {
+        runOnUiThread(() -> {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText("OrderFlow", text));
+            }
+        });
     }
 
     private void hover(boolean gone, float x, float y) {

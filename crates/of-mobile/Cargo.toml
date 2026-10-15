@@ -28,6 +28,8 @@ log = { version = "0.4", features = ["std"] }
 eframe = { version = "0.36.2", default-features = false, features = ["android-game-activity"] }
 # Names the `AndroidApp` eframe takes; the same crate and feature winit uses.
 android-activity = { version = "0.6.1", features = ["game-activity"] }
+# Calls into the Java activity (the system clipboard); the version android-activity uses.
+jni = "0.22.4"
 # of-feed talks TLS through native-tls, which is OpenSSL on Android and reads
 # the system's certificates itself; `vendored` builds OpenSSL with the NDK.
 native-tls = { version = "0.2", features = ["vendored"] }

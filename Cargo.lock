@@ -1946,6 +1946,7 @@ dependencies = [
  "eframe",
  "egui_dock",
  "fontdue",
+ "jni",
  "log",
  "native-tls",
  "of-core",

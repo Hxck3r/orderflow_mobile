@@ -100,7 +100,7 @@ jobs:
           readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           "$readelf" --needed-libs "$so"
           if "$readelf" --needed-libs "$so" | grep -q c++_shared; then echo "libc++_shared.so is needed but not packaged"; exit 1; fi
-          for sym in Java_com_google_androidgamesdk_GameActivity_initializeNativeCode Java_com_orderflow_mobile_MainActivity_nativeInsets Java_com_orderflow_mobile_MainActivity_nativeHover; do
+          for sym in Java_com_google_androidgamesdk_GameActivity_initializeNativeCode Java_com_orderflow_mobile_MainActivity_nativeInsets Java_com_orderflow_mobile_MainActivity_nativeHover Java_com_orderflow_mobile_MainActivity_nativeBack; do
             "$readelf" --dyn-syms --wide "$so" | grep -q " $sym\$" || { echo "missing export: $sym"; exit 1; }
             echo "exported: $sym"
           done

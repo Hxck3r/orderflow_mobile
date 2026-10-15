@@ -7,11 +7,12 @@
 //! What winit 0.30 does not carry on Android comes from [`Platform`]: the
 //! system bars and the camera cutout (egui's root `Ui` ignores safe-area
 //! insets anyway, so the terminal is drawn into a child `Ui` inside them), a
-//! hovering S Pen, and the soft keyboard's text.
+//! hovering S Pen, the soft keyboard's text, the back gesture and the system
+//! clipboard.
 
 use std::time::{Duration, Instant, SystemTime};
 
-use eframe::egui::{self, Align2, Rect, RichText, UiBuilder, pos2};
+use eframe::egui::{self, Align2, Event, Key, Modifiers, OutputCommand, Rect, RichText, UiBuilder, pos2};
 
 use crate::app::TerminalApp;
 use crate::diag::{Diag, GpuInfo, Screen};
@@ -45,6 +46,59 @@ pub trait Platform {
     fn reset_keyboard(&self) {}
     /// Lets the platform wake the interface (a hover or new insets arrive between frames).
     fn set_waker(&self, _ctx: &egui::Context) {}
+    /// Whether the back gesture has something to close, published every
+    /// frame: the platform answers a back press at once, between frames, and
+    /// sends the app to the background when there is nothing.
+    fn set_back_closes(&self, _closes: bool) {}
+    /// A back press the platform left to the interface since the last call.
+    fn take_back(&self) -> bool {
+        false
+    }
+    /// Text the interface copied. egui-winit keeps it inside the app on
+    /// Android; the platform puts it on the system clipboard too.
+    fn copy_text(&self, _text: &str) {}
+}
+
+/// What the back gesture closes, the topmost first. With nothing open, back
+/// sends the app to the background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Back {
+    #[default]
+    Nothing,
+    /// A popup or menu (they close on Escape), or a focused field (Escape takes its focus).
+    Escape,
+    Diagnostics,
+    Crosshair,
+}
+
+/// What back closes, from what the last frame showed.
+pub fn back_target(popup_open: bool, focused: bool, diagnostics: bool, crosshair: bool) -> Back {
+    if popup_open || focused {
+        Back::Escape
+    } else if diagnostics {
+        Back::Diagnostics
+    } else if crosshair {
+        Back::Crosshair
+    } else {
+        Back::Nothing
+    }
+}
+
+/// The text this frame copied (the chart's «Копировать цену», a field's
+/// Ctrl+C), the latest if several; allocates only when there is one.
+fn copied_text(ctx: &egui::Context) -> Option<String> {
+    ctx.output(|o| {
+        o.commands.iter().rev().find_map(|c| match c {
+            OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+    })
+}
+
+fn escape_press(events: &mut Vec<Event>) {
+    for pressed in [true, false] {
+        events.push(Event::Key { key: Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE });
+    }
 }
 
 /// While a text field has focus the keyboard's buffer is polled at this
@@ -57,6 +111,8 @@ pub struct MobileApp {
     diag: Diag,
     platform: Option<Box<dyn Platform>>,
     keyboard: Mirror,
+    /// What a back press closes, from the last frame.
+    back: Back,
     /// The shell's own buttons, last frame: touches there are plain taps.
     own: Vec<Rect>,
     /// A frame the input hook needs (a long press, the keyboard poll): asked
@@ -91,6 +147,7 @@ impl MobileApp {
             diag: Diag::new(gpu),
             platform,
             keyboard: Mirror::Off,
+            back: Back::Nothing,
             own: Vec::new(),
             repaint_in: None,
             settings_seen: modified(&settings_file()),
@@ -134,6 +191,7 @@ impl MobileApp {
             Some(Hover::Gone) => raw.events.insert(0, egui::Event::PointerGone),
             None => {}
         }
+        let back = p.take_back();
         let now = raw.time.unwrap_or(0.0);
         let step = self.keyboard.step(ctx.egui_wants_keyboard_input(), now, || p.keyboard_text().unwrap_or_default());
         if step.reset {
@@ -142,6 +200,32 @@ impl MobileApp {
         raw.events.extend(step.events);
         if step.poll {
             self.repaint_within(KEYBOARD_POLL);
+        }
+        if back {
+            self.press_back(raw);
+        }
+    }
+
+    /// Closes what back found open in the last frame. Before the gestures:
+    /// putting the crosshair away queues its `PointerGone` for this frame.
+    fn press_back(&mut self, raw: &mut egui::RawInput) {
+        match self.back {
+            Back::Escape => escape_press(&mut raw.events),
+            Back::Diagnostics => self.diag.open = false,
+            Back::Crosshair => self.gestures.clear_crosshair(),
+            // The platform sent the app to the background itself.
+            Back::Nothing => {}
+        }
+    }
+
+    /// What this frame leaves for the platform: whether back has something
+    /// to close, and text copied for the system clipboard.
+    fn platform_output(&mut self, ctx: &egui::Context) {
+        self.back = back_target(ctx.any_popup_open(), ctx.egui_wants_keyboard_input(), self.diag.open, self.gestures.crosshair().is_some());
+        let Some(p) = &self.platform else { return };
+        p.set_back_closes(self.back != Back::Nothing);
+        if let Some(text) = copied_text(ctx) {
+            p.copy_text(&text);
         }
     }
 
@@ -212,6 +296,7 @@ impl eframe::App for MobileApp {
         // Gestures apply to the whole terminal: a tap is a click and a long
         // press a hover everywhere; only the shell's own buttons are left alone.
         self.gestures.set_areas(Some(ctx.content_rect()), self.own.clone());
+        self.platform_output(&ctx);
         self.diag.frame_done(started.elapsed());
     }
 
@@ -267,6 +352,61 @@ pub fn mobile_profile(s: &mut AppSettings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn back_closes_the_topmost_thing_open_and_nothing_sends_the_app_away() {
+        assert_eq!(back_target(true, false, true, true), Back::Escape);
+        assert_eq!(back_target(false, true, true, true), Back::Escape);
+        assert_eq!(back_target(false, false, true, true), Back::Diagnostics);
+        assert_eq!(back_target(false, false, false, true), Back::Crosshair);
+        assert_eq!(back_target(false, false, false, false), Back::Nothing);
+    }
+
+    /// One pass with a menu button, its menu opened first when `open`;
+    /// returns what back would see at the end of the pass.
+    fn menu_pass(ctx: &egui::Context, events: Vec<Event>, open: bool) -> bool {
+        ctx.begin_pass(egui::RawInput { events, ..Default::default() });
+        egui::Area::new(egui::Id::new("test-area")).show(ctx, |ui| {
+            let button = ui.button("Вид");
+            if open {
+                egui::Popup::open_id(ctx, egui::Popup::default_response_id(&button));
+            }
+            egui::Popup::menu(&button).show(|ui| ui.label("Bid × Ask"));
+        });
+        let open = ctx.any_popup_open();
+        end_pass(ctx);
+        open
+    }
+
+    /// No renderer takes the font atlas here: drop it as one would.
+    fn end_pass(ctx: &egui::Context) {
+        ctx.end_pass().textures_delta.clear();
+    }
+
+    /// What back relies on in egui: an open menu is seen at the end of the
+    /// pass, and the Escape back sends closes it.
+    #[test]
+    fn the_escape_back_sends_closes_an_open_menu() {
+        let ctx = egui::Context::default();
+        assert!(!menu_pass(&ctx, Vec::new(), false));
+        assert!(menu_pass(&ctx, Vec::new(), true));
+        assert!(menu_pass(&ctx, Vec::new(), false), "stays open");
+        let mut escape = Vec::new();
+        escape_press(&mut escape);
+        menu_pass(&ctx, escape, false);
+        assert!(!menu_pass(&ctx, Vec::new(), false), "closed by Escape");
+    }
+
+    #[test]
+    fn a_copy_in_the_pass_is_found_for_the_system_clipboard() {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        assert_eq!(copied_text(&ctx), None);
+        ctx.copy_text("76 012.5".into());
+        ctx.copy_text("76012.5".into());
+        assert_eq!(copied_text(&ctx).as_deref(), Some("76012.5"));
+        end_pass(&ctx);
+    }
 
     #[test]
     fn the_phone_profile_survives_the_pc_versions_normalize() {

@@ -3,10 +3,11 @@
 //! `android_main` is called by android-activity's GameActivity glue on a
 //! thread of its own, once per activity instance. The Java `MainActivity`
 //! (android/app/src/main/java/com/orderflow/mobile/MainActivity.java) keeps
-//! one activity alive for the process (back moves it to the background,
-//! rotation does not recreate it, a real destroy ends the process) and hands
-//! over through JNI what winit drops: the system-bar and cutout insets and a
-//! hovering S Pen. The soft keyboard's text is read from GameActivity's own
+//! one activity alive for the process (back with nothing open moves it to the
+//! background, rotation does not recreate it, a real destroy ends the process)
+//! and hands over through JNI what winit drops: the system-bar and cutout
+//! insets, a hovering S Pen and the back gesture; Rust calls it back for the
+//! system clipboard. The soft keyboard's text is read from GameActivity's own
 //! buffer.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -15,6 +16,8 @@ use std::sync::{Mutex, OnceLock};
 use android_activity::AndroidApp;
 use android_activity::input::{TextInputState, TextSpan};
 use eframe::egui;
+use jni::objects::{JObject, JValue};
+use jni::{JavaVM, jni_sig, jni_str};
 
 use crate::diag::Screen;
 use crate::shell::{Hover, MobileApp, Platform};
@@ -31,6 +34,10 @@ static INSETS_KNOWN: AtomicBool = AtomicBool::new(false);
 static HOVER: Mutex<Option<Hover>> = Mutex::new(None);
 /// Wakes the interface when Java hands something over between frames.
 static WAKER: OnceLock<Mutex<Option<egui::Context>>> = OnceLock::new();
+/// Whether back has something to close, as the last frame left it
+/// (`Platform::set_back_closes`), and a press left to the interface.
+static BACK_CLOSES: AtomicBool = AtomicBool::new(false);
+static BACK_PRESSED: AtomicBool = AtomicBool::new(false);
 
 fn wake() {
     if let Some(ctx) = WAKER.get().and_then(|w| w.lock().ok()).and_then(|ctx| ctx.clone()) {
@@ -67,6 +74,19 @@ pub extern "system" fn Java_com_orderflow_mobile_MainActivity_nativeHover(_env: 
     wake();
 }
 
+/// `MainActivity.nativeBack()`: the back gesture or key. True when the
+/// interface has something open and closes it on its next frame; false
+/// leaves back to Java, which sends the app to the background.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_orderflow_mobile_MainActivity_nativeBack(_env: *mut std::ffi::c_void, _this: *mut std::ffi::c_void) -> u8 {
+    if !BACK_CLOSES.load(Ordering::Acquire) {
+        return 0;
+    }
+    BACK_PRESSED.store(true, Ordering::Release);
+    wake();
+    1
+}
+
 struct AndroidPlatform {
     app: AndroidApp,
 }
@@ -94,6 +114,37 @@ impl Platform for AndroidPlatform {
         if let Ok(mut slot) = WAKER.get_or_init(|| Mutex::new(None)).lock() {
             *slot = Some(ctx.clone());
         }
+    }
+
+    fn set_back_closes(&self, closes: bool) {
+        BACK_CLOSES.store(closes, Ordering::Release);
+    }
+
+    fn take_back(&self) -> bool {
+        BACK_PRESSED.swap(false, Ordering::AcqRel)
+    }
+
+    fn copy_text(&self, text: &str) {
+        copy_to_clipboard(&self.app, text);
+    }
+}
+
+/// `MainActivity.copyToClipboard(text)`, on this (the interface's) thread;
+/// Java hands it to its own UI thread.
+fn copy_to_clipboard(app: &AndroidApp, text: &str) {
+    // SAFETY: the glue's own VM, alive for the process.
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    let activity = app.activity_as_ptr() as jni::sys::jobject;
+    let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        // SAFETY: a global reference the glue owns, valid while `app` is;
+        // `JObject` never deletes it.
+        let activity = unsafe { JObject::from_raw(env, activity) };
+        let text = env.new_string(text)?;
+        env.call_method(&activity, jni_str!("copyToClipboard"), jni_sig!((java.lang.String) -> void), &[JValue::Object(&text)])?;
+        Ok(())
+    });
+    if let Err(err) = result {
+        log::warn!("clipboard: {err}");
     }
 }
 
