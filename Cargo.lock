@@ -1906,14 +1906,14 @@ dependencies = [
 
 [[package]]
 name = "of-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "of-engine"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "of-core",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "of-feed"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "futures-util",
@@ -1958,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "of-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "log",
@@ -2975,6 +2975,7 @@ checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
 dependencies = [
  "base64",
  "der",
+ "flate2",
  "log",
  "native-tls",
  "percent-encoding",
